@@ -70,29 +70,23 @@ class MultiAgentGridEnv(ParallelEnv):
 
     def step(self, actions):
         current_agents = list(self.agents)
-
-        observations = {}
-        rewards = {}
-        terminations = {}
-        truncations = {}
-        infos = {}
-
         self._steps += 1
 
-        newly_terminated = []
-
+        # === Phase 1 : Deplacer TOUS les agents (avant tout calcul d'obs) ===
+        forbidden_penalties = {}
         for agent in current_agents:
             action = np.asarray(actions[agent], dtype=np.float32)
             action = np.clip(action, -1.0, 1.0)
 
-            # --- Penalite mouvement interdit (sur l'action brute) ---
+            # Penalite mouvement interdit (sur l'action brute)
             forbidden_penalty = 0.0
             if agent in ("agent_1", "agent_3"):
-                forbidden_penalty = -abs(float(action[0])) * 0.5
+                forbidden_penalty = -abs(float(action[0])) * 0.1
             elif agent in ("agent_2", "agent_4"):
-                forbidden_penalty = -abs(float(action[1])) * 0.5
+                forbidden_penalty = -abs(float(action[1])) * 0.1
+            forbidden_penalties[agent] = forbidden_penalty
 
-            # --- Mouvement ---
+            # Mouvement
             norm = np.linalg.norm(action)
             if norm > 1e-8:
                 direction = action / norm
@@ -105,35 +99,34 @@ class MultiAgentGridEnv(ParallelEnv):
                 direction[1] = 0.0
 
             new_pos = self._positions[agent] + direction * STEP_SIZE
-            new_pos = np.clip(new_pos, 0.0, GRID_SIZE)
-            self._positions[agent] = new_pos
+            self._positions[agent] = np.clip(new_pos, 0.0, GRID_SIZE)
 
+        # === Phase 2 : Calculer obs et rewards (toutes les positions a jour) ===
+        observations = {}
+        rewards = {}
+        terminations = {}
+        truncations = {}
+        infos = {}
+        newly_terminated = []
+
+        for agent in current_agents:
             obs = self._get_obs(agent)
             observations[agent] = obs
 
-            # --- Distance et angle vers le goal ---
-            goal = self._goal_map[agent]
-            vec_to_goal = goal - self._positions[agent]
-            dist_to_goal = float(np.linalg.norm(vec_to_goal))
-
+            # Penalite basee sur l'observation : guider chaque distance vers 1.0
             valid_dists = obs[obs >= 0.0]
-            distance_penalty = -float(np.sum(valid_dists)) * 0.1
+            mesh_penalty = -float(np.sum(np.abs(valid_dists - 1.0))) * 0.3
 
-            angle_reward = 0.0
-            if norm > 1e-8 and dist_to_goal > 1e-8:
-                goal_dir = vec_to_goal / dist_to_goal
-                cos_sim = float(np.dot(direction, goal_dir))
-                angle_reward = cos_sim * 0.05
-
-            # --- Penalite temporelle ---
             time_penalty = -0.01
 
-            # --- Terminaison ---
+            # Terminaison
+            goal = self._goal_map[agent]
+            dist_to_goal = float(np.linalg.norm(self._positions[agent] - goal))
             terminated = dist_to_goal <= GOAL_RADIUS
             truncated = self._steps >= MAX_STEPS_PER_EPISODE
 
-            # --- Reward : penalites + petite recompense individuelle ---
-            reward = forbidden_penalty + distance_penalty + angle_reward + time_penalty
+            # Reward
+            reward = forbidden_penalties[agent] + mesh_penalty + time_penalty
             if terminated:
                 reward += 5.0
                 newly_terminated.append(agent)
@@ -146,7 +139,7 @@ class MultiAgentGridEnv(ParallelEnv):
             if terminated or truncated:
                 self._done_flags[agent] = True
 
-        # --- Grande recompense quand TOUS les agents ont fini ---
+        # Grande recompense quand TOUS les agents ont fini
         if all(self._done_flags.values()) and newly_terminated:
             for agent in current_agents:
                 rewards[agent] += 20.0

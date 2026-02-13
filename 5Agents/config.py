@@ -29,7 +29,7 @@ PPO_CONFIG = {
 
 HIDDEN_SIZES = (64, 64)
 
-TOTAL_TIMESTEPS = 200_000
+TOTAL_TIMESTEPS = 500_000
 
 MODEL_DIR = "models"
 MODEL_PATH = "models/ppo_multi.pt"

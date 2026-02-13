@@ -61,12 +61,13 @@ def main():
             with torch.no_grad():
                 actions_t, log_probs_t, values_t = policy.get_action(obs_tensor)
 
-            actions_np = actions_t.cpu().numpy().clip(-1.0, 1.0)
+            actions_raw = actions_t.cpu().numpy()
+            actions_clipped = actions_raw.clip(-1.0, 1.0)
             log_probs_np = log_probs_t.cpu().numpy()
             values_np = values_t.cpu().numpy()
 
             action_dict = {
-                agent: actions_np[i] for i, agent in enumerate(active_agents)
+                agent: actions_clipped[i] for i, agent in enumerate(active_agents)
             }
 
             next_obs, rewards, terminations, truncations, infos = env.step(action_dict)
@@ -74,7 +75,7 @@ def main():
             for i, agent in enumerate(active_agents):
                 done = terminations[agent] or truncations[agent]
                 agent_data[agent]["obs"].append(obs_array[i])
-                agent_data[agent]["act"].append(actions_np[i])
+                agent_data[agent]["act"].append(actions_raw[i])
                 agent_data[agent]["logp"].append(log_probs_np[i])
                 agent_data[agent]["rew"].append(rewards[agent])
                 agent_data[agent]["val"].append(values_np[i])
