@@ -2,118 +2,100 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
-from stable_baselines3 import PPO
+import torch
 
-from envs import MultiAgentWorld
+from envs.grid_env import MultiAgentGridEnv
+from models.ppo import ActorCritic
 from config import (
-    MODEL_PATH_EDGE, MODEL_PATH_CENTRAL,
-    GRID_SIZE, GOAL_POS_CENTRAL, GOAL_RADIUS_CENTRAL,
-    MAX_STEPS_PER_EPISODE, EDGE_AGENTS, GOAL_RADIUS_EDGE,
+    MODEL_PATH, GRID_SIZE, GOAL_POS, GOAL_RADIUS,
+    REF_POINTS, HIDDEN_SIZES, AGENT_NAMES,
 )
 
-EDGE_COLORS = {
-    "bottom": "blue",
-    "left": "orange",
-    "right": "purple",
-    "top": "cyan",
-}
+AGENT_COLORS = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
+REF_LABELS = [f"({p[0]},{p[1]})" for p in REF_POINTS]
 
 
-def collect_joint_episode(edge_model, central_model):
-    world = MultiAgentWorld()
-    world.reset()
-    goal = np.array(GOAL_POS_CENTRAL, dtype=np.float32)
+def collect_episode(policy, env, device):
+    """Collect one episode, return per-agent position histories and step rewards."""
+    observations, _ = env.reset()
 
-    history = {
-        "central": [world.central_pos.copy()],
-    }
-    for name in EDGE_AGENTS:
-        history[name] = [world.get_edge_2d_pos(name).copy()]
+    history = {name: [env._positions[name].copy()] for name in AGENT_NAMES}
+    step_rewards = []
 
-    rewards = []
+    while env.agents:
+        active = list(env.agents)
+        obs_array = np.stack([observations[a] for a in active])
+        obs_tensor = torch.as_tensor(obs_array, dtype=torch.float32).to(device)
 
-    for step in range(MAX_STEPS_PER_EPISODE):
-        central_obs = world.get_central_obs()
-        central_action, _ = central_model.predict(central_obs, deterministic=True)
-        world.apply_central_action(central_action)
+        with torch.no_grad():
+            features = policy.shared(obs_tensor)
+            actions = policy.actor_mean(features)
+            actions = actions.cpu().numpy().clip(-1.0, 1.0)
 
-        names = list(EDGE_AGENTS.keys())
-        obs_batch = np.array([world.get_edge_obs(n) for n in names])
-        actions, _ = edge_model.predict(obs_batch, deterministic=True)
-        for i, name in enumerate(names):
-            world.apply_edge_action(name, actions[i][0])
+        action_dict = {agent: actions[i] for i, agent in enumerate(active)}
+        observations, rewards, terminations, truncations, infos = env.step(action_dict)
 
-        history["central"].append(world.central_pos.copy())
-        for name in EDGE_AGENTS:
-            history[name].append(world.get_edge_2d_pos(name).copy())
+        step_rewards.append(sum(rewards.values()))
 
-        # Reward central
-        obs_after = world.get_central_obs()
-        dist = np.linalg.norm(world.central_pos - goal)
-        if dist <= GOAL_RADIUS_CENTRAL:
-            rewards.append(10.0)
-            break
-        else:
-            rewards.append(-0.01 + (-np.sum(np.abs(obs_after - 1.0))))
+        for name in AGENT_NAMES:
+            if name in env._positions:
+                history[name].append(env._positions[name].copy())
+            else:
+                history[name].append(history[name][-1])
 
-    for key in history:
-        history[key] = np.array(history[key])
+    for name in history:
+        history[name] = np.array(history[name])
 
-    return history, np.array(rewards)
+    return history, np.array(step_rewards)
 
 
 def visualize(history, rewards):
     cum_rewards = np.concatenate(([0.0], np.cumsum(rewards)))
-    n_frames = len(history["central"])
+    n_frames = max(len(h) for h in history.values())
+
+    # Pad shorter histories
+    for name in history:
+        h = history[name]
+        if len(h) < n_frames:
+            pad = np.tile(h[-1], (n_frames - len(h), 1))
+            history[name] = np.concatenate([h, pad])
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # Cadre
-    rect = patches.Rectangle((0, 0), GRID_SIZE, GRID_SIZE, linewidth=2,
-                              edgecolor="black", facecolor="none")
+    rect = patches.Rectangle(
+        (0, 0), GRID_SIZE, GRID_SIZE, linewidth=2,
+        edgecolor="black", facecolor="none",
+    )
     ax.add_patch(rect)
 
-    # Goal central
-    goal = np.array(GOAL_POS_CENTRAL, dtype=np.float32)
-    goal_circle = patches.Circle(goal, GOAL_RADIUS_CENTRAL, color="green", alpha=0.3)
-    ax.add_patch(goal_circle)
-    ax.plot(*goal, "g+", markersize=12, markeredgewidth=2)
+    ref_pts = np.array(REF_POINTS, dtype=np.float32)
+    for pt, label in zip(ref_pts, REF_LABELS):
+        ax.plot(*pt, "ks", markersize=8)
+        ax.annotate(label, pt, textcoords="offset points", xytext=(5, 5), fontsize=8)
 
-    # Goals aretes (milieu de chaque arete)
-    edge_goals = {
-        "bottom": (1.0, 0.0), "left": (0.0, 1.0),
-        "right": (2.0, 1.0), "top": (1.0, 2.0),
-    }
-    for name, pos in edge_goals.items():
-        ax.plot(*pos, "x", color=EDGE_COLORS[name], markersize=10, markeredgewidth=2)
+    for i, name in enumerate(AGENT_NAMES):
+        goal = np.array(GOAL_POS[i], dtype=np.float32)
+        circle = patches.Circle(goal, GOAL_RADIUS, color=AGENT_COLORS[i], alpha=0.2)
+        ax.add_patch(circle)
+        ax.plot(*goal, "+", color=AGENT_COLORS[i], markersize=10, markeredgewidth=2)
 
-    # Trajectoire et point central
-    central_traj, = ax.plot([], [], "r-", alpha=0.3, linewidth=1)
-    central_dot, = ax.plot([], [], "ro", markersize=10, label="Central")
-
-    # Trajectoires et points aretes
-    edge_dots = {}
-    edge_trajs = {}
-    segments = {}
-    dist_texts = {}
-    for name in EDGE_AGENTS:
-        color = EDGE_COLORS[name]
-        traj, = ax.plot([], [], "-", color=color, alpha=0.3, linewidth=1)
-        dot, = ax.plot([], [], "o", color=color, markersize=8, label=name.capitalize())
-        seg, = ax.plot([], [], "--", color=color, alpha=0.4, linewidth=1)
-        txt = ax.text(0, 0, "", fontsize=7, color=color, ha="center")
-        edge_trajs[name] = traj
-        edge_dots[name] = dot
-        segments[name] = seg
-        dist_texts[name] = txt
+    trajs = {}
+    dots = {}
+    for i, name in enumerate(AGENT_NAMES):
+        traj, = ax.plot([], [], "-", color=AGENT_COLORS[i], alpha=0.3, linewidth=1)
+        dot, = ax.plot([], [], "o", color=AGENT_COLORS[i], markersize=8, label=name)
+        trajs[name] = traj
+        dots[name] = dot
 
     step_text = ax.text(
         0.02, 0.98, "", transform=ax.transAxes, fontsize=11,
-        verticalalignment="top", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
     )
     reward_text = ax.text(
         0.02, 0.92, "", transform=ax.transAxes, fontsize=11,
-        verticalalignment="top", bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.5)
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.5),
     )
 
     ax.set_xlim(-0.2, GRID_SIZE + 0.2)
@@ -121,48 +103,34 @@ def visualize(history, rewards):
     ax.set_aspect("equal")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
-    ax.set_title("Multi-Agent PPO — 5 Agents sur GridWorld")
+    ax.set_title("Multi-Agent PPO - 5 Agents GridWorld")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.2)
 
-    all_artists = ([central_traj, central_dot, step_text, reward_text]
-                   + list(edge_trajs.values()) + list(edge_dots.values())
-                   + list(segments.values()) + list(dist_texts.values()))
+    all_artists = list(trajs.values()) + list(dots.values()) + [step_text, reward_text]
 
     def init():
-        central_traj.set_data([], [])
-        central_dot.set_data([], [])
-        for name in EDGE_AGENTS:
-            edge_trajs[name].set_data([], [])
-            edge_dots[name].set_data([], [])
-            segments[name].set_data([], [])
-            dist_texts[name].set_text("")
+        for name in AGENT_NAMES:
+            trajs[name].set_data([], [])
+            dots[name].set_data([], [])
         step_text.set_text("")
         reward_text.set_text("")
         return all_artists
 
     def update(frame):
-        c_pos = history["central"][frame]
-        central_traj.set_data(history["central"][:frame + 1, 0],
-                              history["central"][:frame + 1, 1])
-        central_dot.set_data([c_pos[0]], [c_pos[1]])
-
-        for name in EDGE_AGENTS:
-            e_pos = history[name][frame]
-            edge_trajs[name].set_data(history[name][:frame + 1, 0],
-                                      history[name][:frame + 1, 1])
-            edge_dots[name].set_data([e_pos[0]], [e_pos[1]])
-            segments[name].set_data([c_pos[0], e_pos[0]], [c_pos[1], e_pos[1]])
-            d = np.linalg.norm(c_pos - e_pos)
-            mid = (c_pos + e_pos) / 2
-            dist_texts[name].set_position(mid)
-            dist_texts[name].set_text(f"{d:.2f}")
+        for name in AGENT_NAMES:
+            h = history[name]
+            f = min(frame, len(h) - 1)
+            pos = h[f]
+            trajs[name].set_data(h[: f + 1, 0], h[: f + 1, 1])
+            dots[name].set_data([pos[0]], [pos[1]])
 
         step_text.set_text(f"Step {frame}/{n_frames - 1}")
-        reward_text.set_text(f"Reward = {cum_rewards[frame]:.3f}")
+        r_idx = min(frame, len(cum_rewards) - 1)
+        reward_text.set_text(f"Team Reward = {cum_rewards[r_idx]:.2f}")
 
         if frame == n_frames - 1:
-            timer = fig.canvas.new_timer(interval=1000)
+            timer = fig.canvas.new_timer(interval=1500)
             timer.add_callback(lambda: plt.close(fig))
             timer.single_shot = True
             timer.start()
@@ -170,9 +138,9 @@ def visualize(history, rewards):
 
         return all_artists
 
-    anim = FuncAnimation(
+    _anim = FuncAnimation(
         fig, update, frames=n_frames,
-        init_func=init, interval=150, blit=True, repeat=False
+        init_func=init, interval=150, blit=True, repeat=False,
     )
 
     plt.tight_layout()
@@ -180,14 +148,24 @@ def visualize(history, rewards):
 
 
 def main():
-    edge_model = PPO.load(MODEL_PATH_EDGE)
-    central_model = PPO.load(MODEL_PATH_CENTRAL)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    env = MultiAgentGridEnv()
+    policy = ActorCritic(obs_dim=4, act_dim=2, hidden_sizes=HIDDEN_SIZES).to(device)
+    policy.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    policy.eval()
 
     for k in range(10):
         print(f"\n--- Episode {k + 1}/10 ---")
-        history, rewards = collect_joint_episode(edge_model, central_model)
-        print(f"Steps: {len(history['central']) - 1} | Reward total: {rewards.sum():.3f}")
+        history, rewards = collect_episode(policy, env, device)
+        total_steps = max(len(h) for h in history.values()) - 1
+        print(f"Steps: {total_steps} | Team reward: {rewards.sum():.2f}")
+        for i, name in enumerate(AGENT_NAMES):
+            n = len(history[name]) - 1
+            print(f"  {name} -> {GOAL_POS[i]}: {n} steps")
         visualize(history, rewards)
+
+    env.close()
 
 
 if __name__ == "__main__":

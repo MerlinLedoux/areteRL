@@ -1,101 +1,112 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
+import torch
 
-from envs import MultiAgentWorld
+from envs.grid_env import MultiAgentGridEnv
+from models.ppo import ActorCritic
 from config import (
-    MODEL_PATH_EDGE, MODEL_PATH_CENTRAL,
-    N_EVAL_EPISODES, MAX_STEPS_PER_EPISODE,
-    EDGE_AGENTS, GOAL_RADIUS_CENTRAL, GOAL_RADIUS_EDGE,
-    GOAL_POS_CENTRAL, TIME_PENALTY, REWARD_GOAL,
+    MODEL_PATH, N_EVAL_EPISODES, HIDDEN_SIZES,
+    AGENT_NAMES, N_AGENTS, GOAL_POS,
 )
 
 
-def run_joint_episode(edge_model, central_model):
-    world = MultiAgentWorld()
-    world.reset()
-    goal = np.array(GOAL_POS_CENTRAL, dtype=np.float32)
+def evaluate_episode(policy, env, device):
+    """Run one episode. Returns per-agent rewards and success flags."""
+    observations, _ = env.reset()
+    agent_rewards = {name: 0.0 for name in AGENT_NAMES}
+    agent_success = {name: False for name in AGENT_NAMES}
 
-    total_central_reward = 0.0
-    total_edge_reward = 0.0
+    while env.agents:
+        active = list(env.agents)
+        obs_array = np.stack([observations[a] for a in active])
+        obs_tensor = torch.as_tensor(obs_array, dtype=torch.float32).to(device)
 
-    for step in range(MAX_STEPS_PER_EPISODE):
-        # Central agent
-        central_obs = world.get_central_obs()
-        central_action, _ = central_model.predict(central_obs, deterministic=True)
-        world.apply_central_action(central_action)
+        with torch.no_grad():
+            features = policy.shared(obs_tensor)
+            actions = policy.actor_mean(features)
+            actions = actions.cpu().numpy().clip(-1.0, 1.0)
 
-        # Edge agents (batched)
-        names = list(EDGE_AGENTS.keys())
-        obs_batch = np.array([world.get_edge_obs(n) for n in names])
-        actions, _ = edge_model.predict(obs_batch, deterministic=True)
-        for i, name in enumerate(names):
-            world.apply_edge_action(name, actions[i][0])
+        action_dict = {agent: actions[i] for i, agent in enumerate(active)}
+        observations, rewards, terminations, truncations, infos = env.step(action_dict)
 
-        # Central reward
-        desired = 1.0
-        obs_after = world.get_central_obs()
-        dist_to_goal = np.linalg.norm(world.central_pos - goal)
-        if dist_to_goal <= GOAL_RADIUS_CENTRAL:
-            total_central_reward += REWARD_GOAL
-            break
-        else:
-            total_central_reward += TIME_PENALTY + (-np.sum(np.abs(obs_after - desired)))
+        for agent in action_dict:
+            agent_rewards[agent] += rewards[agent]
+            if terminations[agent]:
+                agent_success[agent] = True
 
-        # Edge reward
-        for name in names:
-            pos = world.edge_positions[name]
-            dist_to_mid = abs(pos - 1.0)
-            if dist_to_mid <= GOAL_RADIUS_EDGE:
-                total_edge_reward += REWARD_GOAL
-            else:
-                total_edge_reward += -dist_to_mid + TIME_PENALTY
-
-    return total_central_reward, total_edge_reward
+    return agent_rewards, agent_success
 
 
 def main():
-    edge_model = PPO.load(MODEL_PATH_EDGE)
-    central_model = PPO.load(MODEL_PATH_CENTRAL)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    central_rewards = []
-    edge_rewards = []
+    env = MultiAgentGridEnv()
+    policy = ActorCritic(obs_dim=4, act_dim=2, hidden_sizes=HIDDEN_SIZES).to(device)
+    policy.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    policy.eval()
 
-    for ep in range(N_EVAL_EPISODES):
-        cr, er = run_joint_episode(edge_model, central_model)
-        central_rewards.append(cr)
-        edge_rewards.append(er)
+    all_rewards = {name: [] for name in AGENT_NAMES}
+    all_success = {name: [] for name in AGENT_NAMES}
+    joint_success = []
 
-    print(f"--- Central agent ({N_EVAL_EPISODES} episodes) ---")
-    print(f"  Reward moyen : {np.mean(central_rewards):.3f}")
-    print(f"  Reward min   : {np.min(central_rewards):.3f}")
-    print(f"  Reward max   : {np.max(central_rewards):.3f}")
+    print(f"Evaluation sur {N_EVAL_EPISODES} episodes...\n")
 
-    print(f"\n--- Edge agents ({N_EVAL_EPISODES} episodes) ---")
-    print(f"  Reward moyen : {np.mean(edge_rewards):.3f}")
-    print(f"  Reward min   : {np.min(edge_rewards):.3f}")
-    print(f"  Reward max   : {np.max(edge_rewards):.3f}")
+    for _ in range(N_EVAL_EPISODES):
+        agent_rewards, agent_success = evaluate_episode(policy, env, device)
+        for name in AGENT_NAMES:
+            all_rewards[name].append(agent_rewards[name])
+            all_success[name].append(agent_success[name])
+        joint_success.append(all(agent_success.values()))
 
-    # Plot
-    episodes = np.arange(1, N_EVAL_EPISODES + 1)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    print("=" * 60)
+    print("Resultats par agent")
+    print("=" * 60)
 
-    ax1.plot(episodes, central_rewards, alpha=0.6)
-    ax1.set_title("Central agent — Reward par episode")
-    ax1.set_xlabel("Episode")
-    ax1.set_ylabel("Reward")
-    ax1.grid(True, alpha=0.3)
+    for i, name in enumerate(AGENT_NAMES):
+        rews = all_rewards[name]
+        rate = np.mean(all_success[name]) * 100
+        print(
+            f"  {name} -> goal {GOAL_POS[i]}: "
+            f"reward={np.mean(rews):>7.2f} +/- {np.std(rews):.2f} | "
+            f"success={rate:.1f}%"
+        )
 
-    ax2.plot(episodes, edge_rewards, alpha=0.6, color="orange")
-    ax2.set_title("Edge agents — Reward par episode")
-    ax2.set_xlabel("Episode")
-    ax2.set_ylabel("Reward")
-    ax2.grid(True, alpha=0.3)
+    joint_rate = np.mean(joint_success) * 100
+    print(f"\n  Joint success (les 5 ont fini): {joint_rate:.1f}%")
 
+    # ---- Plot ----
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes = axes.flatten()
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
+
+    for i, name in enumerate(AGENT_NAMES):
+        ax = axes[i]
+        rews = all_rewards[name]
+        ax.plot(rews, alpha=0.6, color=colors[i])
+        window = min(10, len(rews))
+        if len(rews) >= window:
+            avg = np.convolve(rews, np.ones(window) / window, mode="valid")
+            ax.plot(range(window - 1, len(rews)), avg, color="black", linewidth=2)
+        rate = np.mean(all_success[name]) * 100
+        ax.set_title(f"{name} -> {GOAL_POS[i]} ({rate:.0f}%)")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Reward")
+        ax.grid(True, alpha=0.3)
+
+    ax = axes[5]
+    ax.bar(["Joint\nSuccess"], [joint_rate], color="green", alpha=0.7)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("%")
+    ax.set_title("Joint Success Rate")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle("Multi-Agent PPO Evaluation", fontsize=14)
     plt.tight_layout()
     plt.savefig("eval_rewards.png", dpi=150)
-    print("\nCourbe sauvegardee dans eval_rewards.png")
+    print("\nPlot sauvegarde dans eval_rewards.png")
     plt.show()
+
+    env.close()
 
 
 if __name__ == "__main__":
