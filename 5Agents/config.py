@@ -8,7 +8,7 @@ STEP_SIZE = 0.1
 
 MAX_STEPS_PER_EPISODE = 100
 
-REF_POINTS = ((1, 0), (0, 1), (2, 1), (1, 2))
+REF_POINTS = ((0, 0), (0, 2), (2, 0), (2, 2))
 
 N_AGENTS = 5
 AGENT_NAMES = [f"agent_{i}" for i in range(N_AGENTS)]
